@@ -1410,7 +1410,7 @@ Required functionality takes priority over bonus features.
 |---|---|---|
 | **Ashraful Islam** | Backend / Database | Django REST Framework, PostgreSQL, seat locking, booking, payment integration, callback handling, Docker |
 | **Touhidul Islam** | Frontend | React interface, seat map, booking flow, API integration, payment/confirmation UI |
-| **[Third Member]** | DevOps / QA / Documentation | CI/CD, deployment, concurrency testing, failure testing, README, architecture and documentation |
+| *Abtahee Kabir** | DevOps / QA / Documentation | CI/CD, deployment, concurrency testing, failure testing, README, architecture and documentation |
 ------------------------------------------------------------------------
 
 ## Attribution
