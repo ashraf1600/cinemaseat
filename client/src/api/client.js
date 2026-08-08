@@ -1,8 +1,8 @@
 // Set to false once your teammate's Django backend is running and you've
 // confirmed the real endpoints match these shapes.
-const USE_MOCK = true;
+const USE_MOCK = false;
 
-const BASE_URL = "http://localhost:8000/api";
+const BASE_URL = "http://127.0.0.1:8000/api";
 
 // ---------- Mock data ----------
 
