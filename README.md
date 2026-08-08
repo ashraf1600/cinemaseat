@@ -536,97 +536,180 @@ The exact implementation may combine or separate these tables depending
 on the final backend implementation.
 
 ------------------------------------------------------------------------
-
 ## API
 
-The application exposes REST endpoints for browsing, seat maps, holds,
-payments, callbacks, and bookings.
+The application exposes REST endpoints for browsing movies and showtimes, viewing seat maps, creating seat holds, sending and verifying OTPs, initiating payments, and checking booking status.
+
+All endpoints are available under:
+
+`http://127.0.0.1:8000`
+
+The Django REST Framework API uses JSON for requests and responses. No authentication headers are required (`AllowAny`).
 
 ### Health
 
-``` text
+```text
 GET /health
 ```
 
-Expected:
+Expected response:
 
-``` text
+```text
 HTTP 200
 ```
 
-The health endpoint must remain responsive even when the payment gateway
-is unavailable.
+The health endpoint must remain responsive even when the payment gateway is unavailable.
 
-### Movies
+### API Endpoints
 
-``` text
-GET /api/movies/
+| Method | URL                               | Body                                                    | Response                                                                               |
+| ------ | --------------------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `GET`  | `/api/movies/`                    | —                                                       | `[{"id":1,"title":"...","poster_url":"..."}, ...]`                                     |
+| `GET`  | `/api/showtimes/?movie_id=1`      | —                                                       | `[{"id":1,"movie":1,"theatre":"...","starts_at":"...","base_price":"350.00"}, ...]`    |
+| `GET`  | `/api/showtimes/1/seats/`         | —                                                       | `[{"id":7,"label":"A1","status":"AVAILABLE","price":"350.00"}, ...]`                   |
+| `POST` | `/api/bookings/hold/`             | `{"showtime_id":1,"seat_ids":[7,8],"phone":"+1555..."}` | `201` → `{"booking_id":"bk_...","status":"HELD","expires_at":"...","seats":[...]}`     |
+| `GET`  | `/api/bookings/<ref>/`            | —                                                       | `{"booking_id":"...","status":"HELD","expires_at":"...","seats":[...]}`                |
+| `POST` | `/api/bookings/<ref>/otp/send/`   | —                                                       | `202` → `{"booking_id":"...","otp_ref":"otp_...","status":"SENT"}`                     |
+| `POST` | `/api/bookings/<ref>/otp/verify/` | `{"code":"123456"}`                                     | `200` (verified) or `400` (invalid)                                                    |
+| `POST` | `/api/bookings/<ref>/pay/`        | —                                                       | `202` → `{"booking_id":"...","payment_id":"...","status":"PENDING","amount":"700.00"}` |
+
+### Booking Flow
+
+The normal customer booking flow is:
+
+1. `GET /api/movies/` — Get movies.
+2. `GET /api/showtimes/?movie_id=1` — Get showtimes for a movie.
+3. `GET /api/showtimes/1/seats/` — Get the seat map.
+4. `POST /api/bookings/hold/` — Hold one or more seats.
+5. `GET /api/bookings/<ref>/` — Check the booking.
+6. `POST /api/bookings/<ref>/otp/send/` — Send OTP.
+7. `POST /api/bookings/<ref>/otp/verify/` — Verify OTP.
+8. `POST /api/bookings/<ref>/pay/` — Initiate payment.
+9. `GET /api/bookings/<ref>/` — Check the booking/payment status.
+
+### Example: Fetch Movies
+
+```bash
+curl http://127.0.0.1:8000/api/movies/
 ```
 
-### Showtimes
+### Example: Fetch Showtimes
 
-``` text
-GET /api/showtimes/
+```bash
+curl "http://127.0.0.1:8000/api/showtimes/?movie_id=1"
 ```
 
-### Seat map
+### Example: Fetch Seat Map
 
-``` text
-GET /api/showtimes/{showtime_id}/seats/
+```bash
+curl http://127.0.0.1:8000/api/showtimes/1/seats/
 ```
 
-**Exact judge request:**
+Example response:
 
-``` bash
-curl http://<DEPLOYED_URL>/api/showtimes/<SHOWTIME_ID>/seats/
+```json
+[
+  {
+    "id": 7,
+    "label": "A1",
+    "status": "AVAILABLE",
+    "price": "350.00"
+  }
+]
 ```
 
-> Update the path above to the exact implemented endpoint before
-> submission.
+### Example: Hold Seats
 
-### Hold a seat
-
-``` text
-POST /api/holds/
-Content-Type: application/json
+```bash
+curl -X POST http://127.0.0.1:8000/api/bookings/hold/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "showtime_id": 1,
+    "seat_ids": [7, 8],
+    "phone": "+1555..."
+  }'
 ```
 
-Example:
+Expected response:
 
-``` json
+```text
+HTTP 201
+```
+
+```json
 {
-  "showtime_id": 1,
-  "seat_id": 12
+  "booking_id": "bk_...",
+  "status": "HELD",
+  "expires_at": "...",
+  "seats": []
 }
 ```
 
-**Exact judge request:**
+### Example: Check Booking
 
-``` bash
-curl -X POST http://<DEPLOYED_URL>/api/holds/ \
+```bash
+curl http://127.0.0.1:8000/api/bookings/<ref>/
+```
+
+### Example: Send OTP
+
+```bash
+curl -X POST \
+  http://127.0.0.1:8000/api/bookings/<ref>/otp/send/
+```
+
+Expected response:
+
+```text
+HTTP 202
+```
+
+```json
+{
+  "booking_id": "...",
+  "otp_ref": "otp_...",
+  "status": "SENT"
+}
+```
+
+### Example: Verify OTP
+
+```bash
+curl -X POST \
+  http://127.0.0.1:8000/api/bookings/<ref>/otp/verify/ \
   -H "Content-Type: application/json" \
-  -d '{"showtime_id":1,"seat_id":12}'
+  -d '{
+    "code": "123456"
+  }'
 ```
 
-> Update the URL/body to the exact implemented API contract before
-> submission.
+Expected responses:
 
-### Payment
-
-``` text
-POST /api/payments/
+```text
+HTTP 200 → OTP verified
+HTTP 400 → Invalid OTP
 ```
 
-### Payment callback
+### Example: Initiate Payment
 
-``` text
-POST /api/payments/callback/
+```bash
+curl -X POST \
+  http://127.0.0.1:8000/api/bookings/<ref>/pay/
 ```
 
-### Booking
+Expected response:
 
-``` text
-GET /api/bookings/{booking_id}/
+```text
+HTTP 202
+```
+
+```json
+{
+  "booking_id": "...",
+  "payment_id": "...",
+  "status": "PENDING",
+  "amount": "700.00"
+}
 ```
 
 ------------------------------------------------------------------------
