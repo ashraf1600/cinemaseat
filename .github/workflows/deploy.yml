@@ -1,0 +1,202 @@
+# ============================================================================
+# CinemaSeat — production deployment.
+#
+# Target: Poridhi VM, accessed via SSH.
+#
+# Trigger: ONLY pushes to `main` (never PRs). Branch protection + the
+# ci.yml required check gate merges, so by the time this runs the main
+# branch is green.
+#
+# Change-aware: the `paths:` filter below only fires this workflow when
+# the backend, the frontend, or the surrounding infrastructure actually
+# changed. Doc-only pushes skip deployment entirely.
+#
+# Required repo secrets (configure in repo Settings -> Secrets and
+# variables -> Actions):
+#
+#   DEPLOY_SSH_HOST    - public hostname or IP of the Poridhi VM
+#   DEPLOY_SSH_PORT    - SSH port (defaults to 22 if not set)
+#   DEPLOY_SSH_USER    - SSH user (must be able to run `docker compose`
+#                        without sudo, or use sudo with NOPASSWD)
+#   DEPLOY_SSH_KEY     - private SSH key whose public counterpart is in
+#                        the VM's ~/.ssh/authorized_keys for
+#                        $DEPLOY_SSH_USER
+#   DEPLOY_ENV_FILE    - full contents of the production .env file
+#                        (DJANGO_SECRET_KEY, POSTGRES_PASSWORD,
+#                        GATEWAY_SECRET, BACKEND_PUBLIC_URL, etc.).
+#                        Written to ~/cinemaseat/.env on the VM with
+#                        mode 0600.
+#
+# Required repo VARIABLES (not secrets):
+#
+#   DEPLOY_PUBLIC_URL  - public URL of the deployed stack (e.g.
+#                        https://cinemaseat.example.com). Used by the
+#                        smoke-test step to probe /api/health/.
+#
+# The workflow SSHes into the VM, pulls the latest main, syncs the
+# production .env, and runs `docker compose pull && docker compose up
+# -d`. A trailing health-check hits /api/health/ on the VM's public
+# URL to confirm the new release came up clean.
+# ============================================================================
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "client/**"
+      - "docker-compose.yml"
+      - "backend/Dockerfile"
+      - "client/Dockerfile"
+      - "client/nginx.conf"
+      - ".github/workflows/deploy.yml"
+      - "requirements.txt"
+
+concurrency:
+  # Never run two deploys in parallel — a previous run must finish before
+  # a newer one starts. Safer than cancel-in-progress because we don't
+  # want to leave the VM in a half-deployed state.
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy to Poridhi VM
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.DEPLOY_PUBLIC_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Write the production .env to a tmp file with 0600 perms so we
+      # can scp it onto the VM. Doing this as a file (vs. inline
+      # shell heredoc) keeps the secret out of the GitHub Actions log.
+      # ------------------------------------------------------------------
+      - name: Stage production .env
+        env:
+          DEPLOY_ENV_FILE: ${{ secrets.DEPLOY_ENV_FILE }}
+        run: |
+          if [ -z "$DEPLOY_ENV_FILE" ]; then
+            echo "::error::DEPLOY_ENV_FILE secret is empty."
+            exit 1
+          fi
+          printf '%s\n' "$DEPLOY_ENV_FILE" > /tmp/cinemaseat.env
+          chmod 0600 /tmp/cinemaseat.env
+
+      # ------------------------------------------------------------------
+      # Copy the .env to the VM. We use appleboy/scp-action rather than
+      # inlining a `cat | ssh` heredoc because that would echo the
+      # secret into the GitHub Actions log on any error path. The remote
+      # SSH step then `install`s it with mode 0600.
+      # ------------------------------------------------------------------
+      - name: Upload production .env to VM
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: /tmp/cinemaseat.env
+          target: "~/cinemaseat.env.tmp"
+
+      # ------------------------------------------------------------------
+      # SSH into the VM and redeploy.
+      #
+      # Strategy:
+      #   1. Ensure the project directory exists.
+      #   2. `git fetch` (so we don't blow away local-only files like
+      #      the .env we just scp'd) and fast-forward to the deploy
+      #      commit's SHA.
+      #   3. Sync the .env file with mode 0600.
+      #   4. `docker compose pull` (in case registry images were
+      #      updated) then `up -d --build` to rebuild any locally-
+      #      built images and roll the stack.
+      #   5. `docker compose ps` to confirm everything is up.
+      # ------------------------------------------------------------------
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          # appleboy/ssh-action only forwards envs explicitly listed in
+          # `envs:` below. GitHub Actions defaults like $GITHUB_SHA and
+          # $GITHUB_REPOSITORY are NOT exported to the remote shell
+          # automatically — declare them here, then re-list in `envs:`.
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # We use a single inline script via `script` to keep the
+          # state machine atomic. appleboy/ssh-action also supports
+          # `script_file`, but inline keeps the deploy self-contained.
+          envs: SHA,REPO
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+
+            PROJECT_DIR="$HOME/cinemaseat"
+
+            mkdir -p "$PROJECT_DIR"
+            cd "$PROJECT_DIR"
+
+            # First-time bootstrap: clone if the directory is empty.
+            if [ ! -d ".git" ]; then
+              git clone --no-tags --single-branch --branch main \
+                "https://github.com/${REPO}.git" .
+            fi
+
+            # Fast-forward to the deploy commit.
+            git fetch --prune --tags origin main
+            git reset --hard "$SHA"
+
+            # Sync the production .env. The scp-action step dropped
+            # the file at $HOME/cinemaseat.env.tmp with mode 0600
+            # preserved. `install` atomically replaces the existing
+            # .env (if any) with the right ownership + perms.
+            if [ -f "$HOME/cinemaseat.env.tmp" ]; then
+              install -m 0600 "$HOME/cinemaseat.env.tmp" .env
+              rm -f "$HOME/cinemaseat.env.tmp"
+            else
+              echo "::error::No .env uploaded; aborting deploy."
+              exit 1
+            fi
+
+            # Pull any registry images, then rebuild & restart.
+            docker compose pull || true
+            docker compose up -d --build --remove-orphans
+
+            # Print the final state for the action log.
+            docker compose ps
+
+      # ------------------------------------------------------------------
+      # Smoke test: hit /api/health/ on the VM's public URL. Confirms
+      # the new release is actually serving requests — catches the
+      # case where the deploy succeeded but the new release crashed
+      # on boot.
+      # ------------------------------------------------------------------
+      - name: Health check
+        if: always()
+        env:
+          PUBLIC_URL: ${{ vars.DEPLOY_PUBLIC_URL }}
+        run: |
+          if [ -z "$PUBLIC_URL" ]; then
+            echo "::warning::DEPLOY_PUBLIC_URL is not set; skipping smoke test."
+            exit 0
+          fi
+          echo "Probing $PUBLIC_URL/api/health/"
+          for i in {1..30}; do
+            if curl -fsS "$PUBLIC_URL/api/health/"; then
+              echo "ok"
+              exit 0
+            fi
+            echo "waiting... ($i/30)"
+            sleep 2
+          done
+          echo "::error::Health check failed after 60s."
+          exit 1
