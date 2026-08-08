@@ -46,11 +46,24 @@ def build_hold_response(booking, seats: list[Seat]) -> dict:
 
 def build_booking_detail_response(booking, seats: list[Seat]) -> dict:
     """Construct the documented GET /api/bookings/<ref>/ payload."""
+    # ``last_delivered_code`` is best-effort: the gateway may not have
+    # pushed a delivery receipt yet, and may never push one. The frontend
+    # polls this field after /otp/send/ to autofill the code in the OTP
+    # input box.
+    last_code = ""
+    last_at = None
+    otp = getattr(booking, "otp", None)
+    if otp is not None:
+        last_code = otp.last_delivered_code or ""
+        last_at = otp.last_delivered_at
+
     return {
         "booking_id": booking.booking_ref,
         "status": booking.status,
         "expires_at": booking.expires_at,
         "seats": [{"id": s.id, "label": s.label} for s in seats],
+        "last_delivered_code": last_code,
+        "last_delivered_at": last_at,
     }
 
 

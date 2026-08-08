@@ -361,10 +361,13 @@ def test_otp_send_returns_202_creates_sent_row_and_calls_gateway(client, held_bo
 
     # The gateway call is dispatched in a daemon thread; wait for it.
     _wait_for_send_calls(stub, expected=1)
-    assert stub.calls[0]["kwargs"] == {
-        "phone": held_booking.phone,
-        "ref": otp.ref,
-    }
+    # `callback_url` was added as an additional kwarg after this test was
+    # written; assert the required fields are present without pinning the
+    # whole dict (so future kwarg additions don't break the test).
+    call_kwargs = stub.calls[0]["kwargs"]
+    assert call_kwargs.get("phone") == held_booking.phone
+    assert call_kwargs.get("ref") == otp.ref
+    assert "callback_url" in call_kwargs  # /api/webhooks/otp/
 
 
 @pytest.mark.django_db

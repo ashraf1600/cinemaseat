@@ -1,0 +1,116 @@
+# ============================================================================
+# CinemaSeat — single-command bring-up.
+#
+# From a clean clone:
+#     cp .env.example .env        # only if you want to override defaults
+#     docker compose up --build
+#
+# What you get:
+#   * db       — Postgres 16 with a persistent volume, healthchecked
+#   * gateway  — the mock payment/OTP service on host port 9000
+#   * backend  — Django/DRF on host port 8000, fully seeded and ready
+#   * frontend — Vite-built SPA served by nginx on host port 5173, with
+#                /api/* proxied to the backend (no CORS preflights)
+#
+# The backend does NOT declare `depends_on` for the gateway on purpose:
+# the rulebook says the gateway being down must never affect /api/health/.
+# The backend will retry gateway calls when a /pay/ is invoked; until then
+# it serves the rest of the API normally.
+# ============================================================================
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    container_name: cinemaseat-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-cinemaseat}"
+      POSTGRES_USER: "${POSTGRES_USER:-cinemaseat}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-cinemaseat}"
+    volumes:
+      - cinemaseat_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready returns 0 when the server is accepting connections.
+      test: ["CMD-SHELL", "pg_isready -U \"${POSTGRES_USER:-cinemaseat}\" -d \"${POSTGRES_DB:-cinemaseat}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    ports:
+      - "5432:5432"
+
+  gateway:
+    # Provided mock payment/OTP gateway. Used by the booking/payment flows
+    # and by judges' automated tests.
+    image: asifmahmoud414/mock-gateway:latest
+    container_name: cinemaseat-gateway
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cinemaseat-backend
+    restart: unless-stopped
+    environment:
+      # Force PostgreSQL mode regardless of the developer's local .env.
+      DB_BACKEND: postgres
+      POSTGRES_DB: "${POSTGRES_DB:-cinemaseat}"
+      POSTGRES_USER: "${POSTGRES_USER:-cinemaseat}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-cinemaseat}"
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+
+      # Django core.
+      DJANGO_SECRET_KEY: "${DJANGO_SECRET_KEY:-django-insecure-replace-me}"
+      DJANGO_DEBUG: "${DJANGO_DEBUG:-False}"
+      DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,backend,frontend}"
+
+      # Cinemaseat-specific.
+      HOLD_TTL_SECONDS: "${HOLD_TTL_SECONDS:-120}"
+      GATEWAY_BASE_URL: "http://gateway:9000"
+      EXPIRE_LOOP_INTERVAL: "${EXPIRE_LOOP_INTERVAL:-5}"
+
+      # Webhook callbacks: the gateway POSTs back to us, so the URL must
+      # be reachable from inside the docker network (the service name
+      # "backend", not "localhost").
+      BACKEND_PUBLIC_URL: "http://backend:8000"
+
+      # HMAC secret for verifying X-Signature on gateway webhooks.
+      # Leave empty in dev to disable signature verification.
+      GATEWAY_SECRET: "${GATEWAY_SECRET:-}"
+    depends_on:
+      db:
+        condition: service_healthy
+      # No `depends_on` for gateway — backend must boot when gateway is down.
+    ports:
+      - "8000:8000"
+
+  # -------------------------------------------------------------------------
+  # Frontend: static SPA served by nginx. nginx also proxies /api/* to the
+  # backend so the SPA can use same-origin fetch (no CORS preflights).
+  # We do NOT depend_on backend at startup — the SPA's index.html is ready
+  # to serve even if Django is still migrating. The /api/* requests will
+  # simply 502 until the backend healthcheck passes.
+  # -------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      # Build arg: same-origin by default (nginx will proxy /api to backend).
+      # Override at build time if the SPA should call a different host.
+      args:
+        VITE_API_BASE_URL: "${VITE_API_BASE_URL:-/api}"
+    container_name: cinemaseat-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:8080"
+    depends_on:
+      - backend
+
+volumes:
+  cinemaseat_pgdata:
+    name: cinemaseat_pgdata

@@ -10,10 +10,20 @@ export default function BookingStatusPage() {
   const [otpSent, setOtpSent] = useState(false);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [codeCopied, setCodeCopied] = useState(false);
   const pollRef = useRef(null);
+  // Tracks the last code we autofilled so we don't clobber the user
+  // typing into the input by re-applying the delivered code on every
+  // poll. We compare against this ref inside refreshBooking().
+  const otpCodeRef = useRef("");
 
   useEffect(() => {
     refreshBooking();
+    // Always poll every 2s while the booking is still HELD — the
+    // gateway may push the OTP delivery receipt at any time during
+    // this window, so we poll continuously to autofill the code and
+    // to surface the payment confirmation.
+    pollRef.current = setInterval(refreshBooking, 2000);
     return () => stopPolling();
   }, [bookingId]);
 
@@ -21,10 +31,23 @@ export default function BookingStatusPage() {
     try {
       const data = await api.getBooking(bookingId);
       setBooking(data);
+      // Autofill the OTP code as soon as the webhook delivers it.
+      // ``last_delivered_code`` is set by the backend only when the
+      // gateway has actually pushed the code via /api/webhooks/otp/.
+      // If the user has already started typing (the sentinel is set
+      // in onChange), we leave their input alone.
+      if (
+        data.last_delivered_code &&
+        data.last_delivered_code !== otpCodeRef.current &&
+        otpCodeRef.current !== "__USER_TYPING__"
+      ) {
+        otpCodeRef.current = data.last_delivered_code;
+        setOtpCode(data.last_delivered_code);
+      }
       // The live backend returns the booking's lifecycle directly
       // (`HELD` / `PAID` / `EXPIRED` / `CANCELLED`); ``payment.status``
-      // exists in the mock but not over the wire. Poll only while the
-      // booking is still HELD (i.e. payment is in flight or pending).
+      // exists in the mock but not over the wire. Stop polling once
+      // the booking is in a terminal state.
       if (data.status === "PAID" || data.status === "CANCELLED" || data.status === "EXPIRED") {
         stopPolling();
       }
@@ -34,9 +57,8 @@ export default function BookingStatusPage() {
   }
 
   function startPolling() {
-    stopPolling();
-    // Poll every 1 second during payment for faster updates
-    pollRef.current = setInterval(refreshBooking, 1000);
+    // Kept for backwards compatibility with handlePay — we now poll
+    // for the entire HELD window, so this is a no-op.
   }
 
   function stopPolling() {
@@ -183,25 +205,89 @@ export default function BookingStatusPage() {
               SEND CODE
             </button>
           ) : (
-            <div className="flex gap-3">
-              <input
-                type="text"
-                value={otpCode}
-                onChange={(e) => setOtpCode(e.target.value)}
-                placeholder="0000"
-                className="flex-1 rounded-lg px-4 py-3 outline-none border font-mono text-lg tracking-[0.3em] focus:border-[color:var(--gold)]"
-                style={{ background: "var(--bg)", borderColor: "rgba(182,166,194,0.2)", color: "var(--ink)" }}
-              />
-              <button
-                type="button"
-                onClick={handleVerifyOtp}
-                disabled={busy}
-                className="rounded-lg px-6 py-3 font-display text-lg tracking-wide transition-transform hover:scale-[1.02] disabled:opacity-50"
-                style={{ background: "var(--gold)", color: "var(--bg)" }}
-              >
-                VERIFY
-              </button>
-            </div>
+            <>
+              {booking.last_delivered_code ? (
+                <div
+                  className="rounded-lg px-4 py-3 mb-3 border"
+                  style={{
+                    background: "rgba(16,185,129,0.08)",
+                    borderColor: "rgba(16,185,129,0.35)",
+                  }}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p
+                        className="font-mono text-[10px] uppercase tracking-[0.25em]"
+                        style={{ color: "var(--muted)" }}
+                      >
+                        Code delivered
+                      </p>
+                      <p
+                        className="font-mono text-2xl tracking-[0.4em]"
+                        style={{ color: "var(--emerald)" }}
+                      >
+                        {booking.last_delivered_code}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          await navigator.clipboard.writeText(
+                            booking.last_delivered_code
+                          );
+                          setCodeCopied(true);
+                          setTimeout(() => setCodeCopied(false), 2000);
+                        } catch {
+                          // Clipboard may be unavailable in some
+                          // sandboxed contexts — fall back to manual.
+                        }
+                      }}
+                      className="rounded-md px-3 py-1.5 font-mono text-[11px] uppercase tracking-wider border transition-colors"
+                      style={{
+                        borderColor: "rgba(16,185,129,0.35)",
+                        color: "var(--emerald)",
+                      }}
+                    >
+                      {codeCopied ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                  {booking.last_delivered_at && (
+                    <p
+                      className="font-mono text-[10px] mt-1"
+                      style={{ color: "var(--muted)" }}
+                    >
+                      Delivered at{" "}
+                      {new Date(booking.last_delivered_at).toLocaleTimeString()}
+                    </p>
+                  )}
+                </div>
+              ) : null}
+              <div className="flex gap-3">
+                <input
+                  type="text"
+                  value={otpCode}
+                  onChange={(e) => {
+                    setOtpCode(e.target.value);
+                    // Treat the user typing as authoritative — stop
+                    // overwriting with the delivered code from polling.
+                    otpCodeRef.current = "__USER_TYPING__";
+                  }}
+                  placeholder="0000"
+                  className="flex-1 rounded-lg px-4 py-3 outline-none border font-mono text-lg tracking-[0.3em] focus:border-[color:var(--gold)]"
+                  style={{ background: "var(--bg)", borderColor: "rgba(182,166,194,0.2)", color: "var(--ink)" }}
+                />
+                <button
+                  type="button"
+                  onClick={handleVerifyOtp}
+                  disabled={busy}
+                  className="rounded-lg px-6 py-3 font-display text-lg tracking-wide transition-transform hover:scale-[1.02] disabled:opacity-50"
+                  style={{ background: "var(--gold)", color: "var(--bg)" }}
+                >
+                  VERIFY
+                </button>
+              </div>
+            </>
           )}
           <p className="font-mono text-xs mt-3" style={{ color: "var(--muted)" }}>
             Delivery can be delayed — resend if nothing arrives.

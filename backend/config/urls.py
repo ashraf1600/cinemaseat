@@ -4,6 +4,9 @@ from django.urls import include, path
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    # Health endpoint — must be reachable before any other /api/ route
+    # so load balancers and orchestrators can probe it directly.
+    path("api/health/", include("core.urls")),
     # Catalog endpoints are mounted at /api/ per the README contract
     # (/api/movies/, /api/showtimes/, /api/showtimes/<id>/seats/).
     path("api/", include("catalog.urls")),

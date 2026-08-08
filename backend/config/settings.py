@@ -198,3 +198,15 @@ HOLD_TTL_SECONDS = int(os.environ.get("HOLD_TTL_SECONDS", "120"))
 
 # Base URL of the upstream payment gateway service.
 GATEWAY_BASE_URL = os.environ.get("GATEWAY_BASE_URL", "http://gateway:9000")
+
+# Public URL *we* are reachable at — used to build callback URLs handed to
+# the gateway (so its webhook deliveries route back to the right container).
+# In docker-compose this is the backend service name + exposed port.
+BACKEND_PUBLIC_URL = os.environ.get(
+    "BACKEND_PUBLIC_URL",
+    "http://backend:8000",
+)
+
+# Shared secret used to verify the ``X-Signature`` HMAC on incoming webhook
+# deliveries. Empty value disables verification (local dev only).
+GATEWAY_SECRET = os.environ.get("GATEWAY_SECRET", "")

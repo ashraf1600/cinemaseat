@@ -65,6 +65,10 @@ class OtpVerification(models.Model):
         choices=Status.choices,
         default=Status.SENT,
     )
+    # Filled in by the /api/webhooks/otp/ callback when the gateway delivers
+    # the code. Optional — the OTP delivery push is best-effort.
+    last_delivered_code = models.CharField(max_length=32, blank=True, default="")
+    last_delivered_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-id"]

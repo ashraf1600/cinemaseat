@@ -549,16 +549,20 @@ The Django REST Framework API uses JSON for requests and responses. No authentic
 ### Health
 
 ```text
-GET /health
+GET /api/health/
 ```
 
 Expected response:
 
 ```text
 HTTP 200
+{"status": "ok", "db": "ok"}
 ```
 
-The health endpoint must remain responsive even when the payment gateway is unavailable.
+The health endpoint DB-probes via a single `SELECT 1` and is
+deliberately gateway-free — it must remain responsive even when the
+payment gateway is unavailable. Designed for load-balancer / orchestrator
+probes.
 
 ### API Endpoints
 
@@ -572,6 +576,19 @@ The health endpoint must remain responsive even when the payment gateway is unav
 | `POST` | `/api/bookings/<ref>/otp/send/`   | —                                                       | `202` → `{"booking_id":"...","otp_ref":"otp_...","status":"SENT"}`                     |
 | `POST` | `/api/bookings/<ref>/otp/verify/` | `{"code":"123456"}`                                     | `200` (verified) or `400` (invalid)                                                    |
 | `POST` | `/api/bookings/<ref>/pay/`        | —                                                       | `202` → `{"booking_id":"...","payment_id":"...","status":"PENDING","amount":"700.00"}` |
+| `POST` | `/api/webhooks/payment/`          | gateway-only (HMAC `X-Signature`)                       | `200` (always; duplicates & missing fields accepted)                                 |
+| `POST` | `/api/webhooks/otp/`              | gateway-only (HMAC `X-Signature`)                       | `200` (always; stashes delivered code on `OtpVerification`)                          |
+
+The two `/api/webhooks/` endpoints are unauthenticated but **HMAC-signed**
+when `GATEWAY_SECRET` is set in the environment. The gateway computes
+`HMAC-SHA256(secret, raw_body)` and sends it as `X-Signature`. A missing
+or invalid signature returns `401`; an empty `GATEWAY_SECRET` disables
+verification (local dev only).
+
+The `/pay/` endpoint forwards an `Idempotency-Key` header to the
+gateway on every charge call (and stores the same key on the local
+`Payment` row for audit). A retry of `/pay/` for the same booking
+**reuses** the existing key — so the gateway can dedupe.
 
 ### Booking Flow
 
@@ -784,6 +801,24 @@ Required result:
 The test also fetches the seat map afterward and verifies that the seat
 is held exactly once.
 
+This test lives in `backend/tests/test_seat_hold_concurrency.py` and is
+**automatically skipped on SQLite** — SQLite's single-writer lock makes
+true thread contention unreliable. Run it under PostgreSQL (the
+docker-compose default) to exercise the row-lock guarantee.
+
+### Test suite summary
+
+The full suite (`pytest` in `backend/`) is **60 passing tests**,
+excluding the SQLite-skipped concurrency test:
+
+- **Booking view tests** (`booking/tests.py`): hold/OTP/pay flow,
+  concurrency strategy, webhook contract, idempotent dedup, expiry
+  sweep.
+- **Payment webhook tests** (`payments/tests.py`): HMAC verification
+  (accept/reject/missing), replay protection, lenient parser for
+  unknown fields, OTP-delivery code stashing, `Idempotency-Key`
+  forwarding on `/pay/`.
+
 ### Scenario B --- Abandoned hold
 
 ``` text
@@ -894,49 +929,143 @@ when the gateway is unavailable.
 
 ## CI/CD
 
-GitHub Actions is used for automated validation and deployment.
+GitHub Actions is used for automated validation and deployment. The
+configuration lives in `.github/workflows/`.
 
-### Pull request / push workflow
+### CI — required check (`.github/workflows/ci.yml`)
+
+Runs on every pull request targeting `main` and on every push to `main`.
+Three jobs, all must pass:
+
+| Job                | Purpose                                                                |
+| ------------------ | ---------------------------------------------------------------------- |
+| `test-sqlite`      | Full pytest run against the same SQLite backend developers use locally. Fast feedback. |
+| `test-postgres`    | Full pytest run against a real PostgreSQL 16 service container. This is the only job where the 100-thread concurrent-hold test actually executes, so concurrency correctness is checked on every PR. |
+| `build-client`     | `npm run build` for the React client, catches Vite/build breakage. |
+
+The Postgres job overrides `DJANGO_SETTINGS_MODULE=config.settings` so
+`DB_BACKEND=postgres` switches the engine; `backend/conftest.py` then
+sees a non-SQLite engine and stops auto-skipping the concurrency test.
+
+**Branch protection.** `ci.yml` is set up as a **required status check**
+on `main`. Configure this in repository settings → Branches → Branch
+protection rules → `main`:
+
+- ☑ Require a pull request before merging
+- ☑ Require approvals: 1
+- ☑ Require status checks to pass before merging
+  - ☑ *ci* (the workflow name above; pick the job(s) GitHub surfaces)
+- ☑ Require branches to be up to date before merging
+
+Once configured, GitHub will block merge buttons until the green tick
+from `ci` is present on the PR head.
 
 ``` text
 Developer
     |
     v
-GitHub
+GitHub PR / push
     |
     v
-CI
+ci.yml
     |
-    +--> Install dependencies
-    |
-    +--> Run tests
-    |
-    +--> Build/check
+    +--> test-sqlite   (fast feedback)
+    +--> test-postgres (real concurrency)
+    +--> build-client  (Vite sanity)
     |
     v
-PASS / FAIL
+PASS / FAIL  ──► blocks merge if FAIL
 ```
 
-### Deployment workflow
+### CD — deployment (`.github/workflows/deploy.yml`)
+
+Runs **only on push to `main`** (never on PRs). Two guards make this
+safe:
+
+1. The `ci.yml` required check must have passed on the merged commit.
+2. The workflow has a `paths:` filter so it only fires when the
+   backend or infra actually changed — doc-only and client-only pushes
+   skip deployment entirely.
 
 ``` text
-Push to default branch
-          |
-          v
-       CI passes
-          |
-          v
-     Build images
-          |
-          v
-      Deploy
-          |
-          v
-   Health verification
+Push to main (paths: backend/**, Dockerfile, ...)
+        |
+        v
+   ci.yml is green  (required check)
+        |
+        v
+   deploy.yml
+        |
+        +--> Build / push artifacts
+        +--> Deploy to target (Poridhi VM | AWS)
+        +--> curl /api/health/  (smoke test)
+        |
+        v
+   production live
 ```
 
-CI runs on pull requests and pushes to the default branch. CD runs on
-pushes to the default branch.
+**Deployment target — Poridhi VM (chosen).** The deploy job runs
+`appleboy/scp-action@v1` to ship the production `.env`, then
+`appleboy/ssh-action@v1` to log into the VM and execute the bootstrap
+script below. Each push to `main` fast-forwards the VM's local clone
+to the merged commit and reloads the stack with
+`docker compose pull && docker compose up -d --build`. A trailing
+`curl` against `${DEPLOY_PUBLIC_URL}/api/health/` is the smoke test —
+if it returns 200, the deploy is considered green.
+
+``` text
+Push to main (paths: backend/**, client/**, docker-compose.yml, ...)
+        |
+        v
+   ci.yml is green   (required check)
+        |
+        v
+   deploy.yml
+        |
+        +-- Stage /tmp/cinemaseat.env on runner (chmod 0600)
+        |
+        +-- scp-action  --> ~/cinemaseat.env.tmp on VM
+        |
+        +-- ssh-action  --> ~/cinemaseat (clone or fetch + reset --hard)
+        |                   install -m 0600 .env, then
+        |                   docker compose pull && up -d --build
+        |
+        +-- curl ${DEPLOY_PUBLIC_URL}/api/health/   (smoke test)
+        |
+        v
+   production live
+```
+
+**One-time VM bootstrap (run once, by hand, on the Poridhi VM).** The
+deploy SSH user needs to be able to run `docker compose`. Either add
+the user to the `docker` group, or grant passwordless sudo for the
+exact `docker compose` command. The user's `~/.ssh/authorized_keys`
+must contain the public half of the key stored in
+`DEPLOY_SSH_KEY`.
+
+``` bash
+# As the deploy user on the Poridhi VM
+sudo usermod -aG docker "$USER"   # log out / back in for it to take effect
+mkdir -p ~/cinemaseat             # the deploy script will `git clone` into it
+```
+
+**Required repository secrets & variables.** Configure these in
+*Settings → Secrets and variables → Actions* before the first push to
+`main`:
+
+  Variable / Secret        Kind     Purpose
+  ------------------------ -------- -----------------------------------------------------------------
+  `DEPLOY_SSH_HOST`        Secret   Poridhi VM hostname or IP.
+  `DEPLOY_SSH_PORT`        Secret   SSH port (default 22; only set if non-standard).
+  `DEPLOY_SSH_USER`        Secret   Linux user on the VM who can run `docker compose`.
+  `DEPLOY_SSH_KEY`         Secret   Private SSH key (PEM). Its public counterpart must be in `~/.ssh/authorized_keys` on the VM. Recommended: a dedicated ed25519 key used only for deploys.
+  `DEPLOY_ENV_FILE`        Secret   Full contents of the production `.env` (Django secret, Postgres password, `GATEWAY_SECRET`, `BACKEND_PUBLIC_URL`, etc.). Stored as a single multi-line secret; the workflow stages it to `/tmp/cinemaseat.env` with mode 0600 and atomically installs it on the VM.
+  `DEPLOY_PUBLIC_URL`      Variable (not secret)   Public URL of the deployed stack (e.g. `https://cinemaseat.example.com`). Used by the smoke-test `curl`.
+
+> The deploy job has `concurrency: deploy-${{ github.ref }}` with
+> `cancel-in-progress: false`, so two pushes in quick succession run
+> serially — the second one waits for the first to finish, never
+> tears down a half-deployed VM.
 
 ------------------------------------------------------------------------
 
@@ -946,41 +1075,34 @@ pushes to the default branch.
 .
 ├── backend/
 │   ├── manage.py
-│   ├── config/
-│   ├── apps/
 │   ├── requirements.txt
-│   └── ...
+│   ├── pytest.ini
+│   ├── conftest.py
+│   ├── config/          # Django project (settings, urls, asgi/wsgi)
+│   ├── booking/         # core app: seats, holds, payments, webhooks, expiry loop
+│   ├── catalog/         # movies / showtimes / seed_demo_data
+│   ├── payments/        # payment-status app
+│   └── core/            # shared base app
 │
-├── frontend/
-│   ├── src/
-│   ├── public/
+├── client/              # React + Vite SPA
 │   ├── package.json
-│   └── ...
-│
-├── tests/
-│   ├── concurrency/
-│   ├── payment/
-│   └── ...
-│
-├── docs/
-│   ├── architecture.md
-│   ├── architecture.png
-│   ├── deployment.md
-│   └── test-results.md
+│   ├── vite.config.js
+│   ├── index.html
+│   ├── Dockerfile       # multi-stage Node 20 build → nginx 1.27 runtime
+│   ├── nginx.conf       # SPA serve + /api proxy + /healthz
+│   ├── public/
+│   └── src/             # pages/, components/, api/
 │
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml
-│       └── cd.yml
+│       ├── ci.yml       # 3-job required check (sqlite, postgres, client build)
+│       └── deploy.yml   # Poridhi VM via appleboy/scp-action + ssh-action
 │
-├── docker-compose.yml
-├── Dockerfile
+├── docker-compose.yml   # db + gateway + backend + frontend (single `up --build`)
 ├── .env.example
 ├── DECISIONS.md
 └── README.md
 ```
-
-Update this structure if the final repository differs.
 
 ------------------------------------------------------------------------
 
@@ -993,6 +1115,7 @@ Example:
 ``` env
 DEBUG=False
 
+DB_BACKEND=postgres
 POSTGRES_DB=cinemaseat
 POSTGRES_USER=cinemaseat
 POSTGRES_PASSWORD=change_me
@@ -1001,25 +1124,36 @@ POSTGRES_PORT=5432
 
 HOLD_TTL_SECONDS=120
 
-GATEWAY_URL=http://gateway:9000
+GATEWAY_BASE_URL=http://gateway:9000
+BACKEND_PUBLIC_URL=http://backend:8000
+GATEWAY_SECRET=
 
 DJANGO_SECRET_KEY=change_me
-ALLOWED_HOSTS=localhost,127.0.0.1
+DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1
 ```
+
+`DB_BACKEND=sqlite` (default) uses the file-backed `db.sqlite3` for
+local dev; set it to `postgres` in any deployment that needs real
+concurrency control.
 
 ### Required/important variables
 
   Variable              Required   Purpose
   --------------------- ---------- ---------------------------------
   `HOLD_TTL_SECONDS`    Yes        Configurable seat-hold duration
-  `GATEWAY_URL`         Yes        Provided payment/OTP gateway
-  `POSTGRES_DB`         Yes        PostgreSQL database
-  `POSTGRES_USER`       Yes        PostgreSQL user
-  `POSTGRES_PASSWORD`   Yes        PostgreSQL password
-  `POSTGRES_HOST`       Yes        PostgreSQL hostname
-  `POSTGRES_PORT`       Yes        PostgreSQL port
+  `GATEWAY_BASE_URL`    Yes        Provided payment/OTP gateway base URL
+  `BACKEND_PUBLIC_URL`  Yes        URL we tell the gateway to call back to (used to build webhook callback URLs)
+  `GATEWAY_SECRET`      Yes        HMAC-SHA256 secret for verifying `X-Signature` on webhook deliveries (empty disables — local dev only)
+  `DB_BACKEND`          No         `sqlite` (default) or `postgres`
+  `POSTGRES_DB`         When postgres   PostgreSQL database
+  `POSTGRES_USER`       When postgres   PostgreSQL user
+  `POSTGRES_PASSWORD`   When postgres   PostgreSQL password
+  `POSTGRES_HOST`       When postgres   PostgreSQL hostname
+  `POSTGRES_PORT`       When postgres   PostgreSQL port
   `DJANGO_SECRET_KEY`   Yes        Django secret
-  `ALLOWED_HOSTS`       Yes        Allowed Django hosts
+  `DJANGO_ALLOWED_HOSTS` Yes       Allowed Django hosts
+  `VITE_API_BASE_URL`   No         Base URL baked into the SPA bundle at `client` build time. Defaults to `/api` so nginx can proxy same-origin. Override only when the SPA and API live on different origins.
+  `EXPIRE_LOOP_INTERVAL` No        Seconds between background `expire_holds` sweeps (default 5).
 
 Never commit real credentials or secrets to GitHub.
 
@@ -1076,20 +1210,35 @@ The Docker Compose stack contains the core application services:
 
 ``` yaml
 services:
-  frontend:
-    ...
+  frontend:    # React SPA built by Vite, served by nginx; /api/* proxied to backend
+    build: ./client
+    ports: ["5173:8080"]
 
-  backend:
-    ...
+  backend:     # Django + DRF + Gunicorn; talks to db + gateway over the compose network
+    build: ./backend
+    ports: ["8000:8000"]
 
-  postgres:
-    ...
+  postgres:    # Postgres 16 with a persistent named volume
+    image: postgres:16-alpine
+    ports: ["5432:5432"]
 
-  gateway:
+  gateway:     # Mock payment / OTP gateway (provided image, no build)
     image: asifmahmoud414/mock-gateway:latest
-    ports:
-      - "9000:9000"
+    ports: ["9000:9000"]
 ```
+
+After `docker compose up --build` the stack is fully usable:
+
+  URL                  Purpose
+  -------------------- ----------------------------------------------
+  `http://localhost:5173`  React SPA (entry point for browsers)
+  `http://localhost:8000/api/...`  DRF API (curl / Postman)
+  `http://localhost:8000/api/health/`  Health check used by CI smoke test
+  `http://localhost:9000/...`  Mock gateway (judges / integration tests)
+
+`/api/*` requests from the SPA are proxied by nginx to `backend:8000`,
+so the browser makes same-origin requests and CORS preflights are not
+needed.
 
 Start:
 
@@ -1245,7 +1394,9 @@ considered:
 -   Authentication and authorization.
 -   Rate limiting.
 -   Input validation.
--   Gateway callback signature verification.
+-   ~~Gateway callback signature verification.~~ **Implemented** — see
+    `payments/signature.py` (HMAC-SHA256 `X-Signature` on both
+    `/api/webhooks/payment/` and `/api/webhooks/otp/`).
 -   AWS deployment.
 -   Scenario C breakpoint/load testing.
 
@@ -1285,19 +1436,25 @@ Before submission, verify:
 -   [ ] Architecture diagram is included.
 -   [ ] Exact seat-map request is documented.
 -   [ ] Exact seat-hold request is documented.
--   [ ] `GET /health` returns HTTP 200.
+-   [ ] `GET /api/health/` returns HTTP 200.
 -   [ ] `HOLD_TTL_SECONDS` is read from the environment.
 -   [ ] `docker compose up` works from a clean clone.
 -   [ ] Provided gateway is integrated.
 -   [ ] Payment callbacks are asynchronous.
 -   [ ] Duplicate callbacks are idempotent.
+-   [ ] Webhook deliveries are HMAC-verified when `GATEWAY_SECRET` is set.
+-   [ ] `/pay/` forwards an `Idempotency-Key` header to the gateway.
 -   [ ] Hold expiration works.
 -   [ ] 100 concurrent requests for one seat produce exactly one
     successful hold.
 -   [ ] Oversell count is zero.
 -   [ ] Deployment URL is reachable.
--   [ ] CI runs successfully.
--   [ ] CD/deployment workflow works.
+-   [ ] CI runs successfully on every PR (`test-sqlite`,
+    `test-postgres`, `build-client` all green).
+-   [ ] CI is a **required check** on `main` (branch protection blocks
+    merge until green).
+-   [ ] CD/deployment workflow works and is wired to the chosen target
+    (Poridhi VM via SSH or AWS).
 -   [ ] Test results are documented.
 -   [ ] No secrets are committed.
 -   [ ] Code is frozen before final submission.

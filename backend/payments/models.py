@@ -22,6 +22,12 @@ class Payment(models.Model):
     # `payment_id` is the gateway's identifier — we only know it once the
     # upstream call succeeds, so it's nullable. Unique when present.
     payment_id = models.CharField(max_length=128, null=True, blank=True, unique=True)
+    # `idempotency_key` is OUR identifier, generated per (booking, attempt).
+    # Sent to the gateway as the ``Idempotency-Key`` header so even if our
+    # background /charge worker retries, the gateway won't double-charge.
+    idempotency_key = models.CharField(
+        max_length=64, null=True, blank=True, unique=True
+    )
     status = models.CharField(
         max_length=16,
         choices=Status.choices,
@@ -70,3 +76,30 @@ class PaymentEvent(models.Model):
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return f"PaymentEvent({self.event_id}, {self.status})"
+
+
+class OtpDeliveryEvent(models.Model):
+    """
+    Append-only log of every OTP-delivery webhook from the gateway.
+
+    Mirrors ``PaymentEvent`` for the OTP domain. ``event_id`` is the
+    idempotency key — duplicate deliveries are rejected at the DB level.
+    """
+
+    event_id = models.CharField(max_length=128, unique=True)
+    # The booking ref the OTP was issued against; nullable so a stray
+    # delivery (no matching OTP row) can still be recorded.
+    booking_ref = models.CharField(max_length=64, blank=True, default="")
+    ref = models.CharField(max_length=64, blank=True, default="")
+    code = models.CharField(max_length=32, blank=True, default="")
+    received_at = models.DateTimeField(auto_now_add=True)
+    raw_payload = models.JSONField()
+
+    class Meta:
+        ordering = ["-received_at"]
+        indexes = [
+            models.Index(fields=["booking_ref", "received_at"]),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return f"OtpDeliveryEvent({self.event_id}, ref={self.ref})"

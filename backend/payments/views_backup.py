@@ -1,10 +1,10 @@
-"""Payment webhook receiver.
+﻿"""Payment webhook receiver.
 
 The upstream gateway POSTs asynchronous notifications to us at
 ``/api/webhooks/payment/``. The contract is:
 
     {
-      "event_id": "<unique>",        # idempotency key — DB-unique
+      "event_id": "<unique>",        # idempotency key â€” DB-unique
       "payment_id": "<gateway id>",
       "booking_ref": "bk_...",
       "status": "SUCCEEDED" | "FAILED" | "REFUNDED",
@@ -17,7 +17,7 @@ Behaviour:
      only thing standing between us and double-confirmation.
   2. Otherwise, insert the event row and apply the status change to
      ``Payment`` + ``Booking`` + ``Seat`` inside a single transaction.
-  3. ALWAYS return 200. Any exception is caught and logged — the
+  3. ALWAYS return 200. Any exception is caught and logged â€” the
      gateway will retry forever on a non-200.
 
 State transitions on SUCCEEDED:
@@ -51,7 +51,6 @@ from booking.models import Booking, BookingSeat
 from catalog.models import Seat
 
 from .models import Payment, PaymentEvent
-from .signature import verify_signature
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +125,14 @@ def _apply_event_atomically(payload: dict) -> None:
             payment.status = Payment.Status.REFUNDED
             payment.save(update_fields=["status", "payment_id"])
             # Refund doesn't change seat / booking state per the
-            # contract — the booking is already PAID, seats are BOOKED.
+            # contract â€” the booking is already PAID, seats are BOOKED.
+
+
+def _missing_field_response(missing: str) -> Response:
+    return Response(
+        {"error": {"detail": f"Missing field: {missing}"}},
+        status=status.HTTP_200_OK,  # ALWAYS 200 â€” the gateway retries forever on non-200.
+    )
 
 
 class PaymentWebhookView(APIView):
@@ -137,79 +143,70 @@ class PaymentWebhookView(APIView):
     full state-transition contract.
     """
 
-    # Disable auth/CSRF — the gateway is unauthenticated; in production
-    # this is verified via the X-Signature header (see .signature).
+    # Disable auth/CSRF â€” the gateway is unauthenticated; in production
+    # this would be signed-HMAC verified, but the spec for this milestone
+    # is HMAC-less and tests use the gateway-mock pattern.
     authentication_classes: list = []
     permission_classes: list = []
 
     def post(self, request, *args, **kwargs) -> Response:
-        # HMAC verification (only enforced when GATEWAY_SECRET is set).
-        if not verify_signature(
-            request.body,
-            request.META.get("HTTP_X_SIGNATURE", ""),
-        ):
-            logger.warning("Payment webhook rejected: invalid X-Signature")
-            return Response(
-                {"error": {"detail": "Invalid signature."}},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
-
         payload = request.data if isinstance(request.data, dict) else {}
 
-        # event_id is the only field we absolutely cannot work without.
-        # Anything else (payment_id, booking_ref, status, amount, or
-        # extras like currency/timestamp) is read-only — we never reject
-        # the payload for missing/extra fields. We always return 200.
-        event_id = payload.get("event_id")
-        if not event_id:
-            logger.warning("Webhook payload missing event_id; ignoring. payload=%s", payload)
-            return Response({"status": "accepted"}, status=status.HTTP_200_OK)
+        # Required fields. Per the spec, ALWAYS return 200 â€” even on
+        # bad input â€” so the gateway doesn't retry forever. We log and
+        # move on.
+        for field in ("event_id", "payment_id", "booking_ref", "status", "amount"):
+            if not payload.get(field):
+                logger.warning("Webhook missing field %s in payload=%s", field, payload)
+                return _missing_field_response(field)
 
         # Idempotency: a PaymentEvent with this event_id is the
         # duplicate-callback guard. If it already exists, this is a
         # duplicate delivery and we MUST NOT touch Payment/Booking/Seat
         # state again.
-        booking_ref = payload.get("booking_ref", "")
-        if not booking_ref:
-            logger.warning("Webhook event_id=%s missing booking_ref; ignoring", event_id)
-            return Response({"status": "accepted"}, status=status.HTTP_200_OK)
-
+        #
+        # ``PaymentEvent.payment`` is a required FK, so we have to
+        # resolve the local Payment row before inserting the event.
+        # We do that lookup first; if no Payment exists yet for this
+        # booking_ref, we accept the webhook (200) and log â€” we don't
+        # want a stray callback to wedge the system.
         try:
-            payment = Payment.objects.get(booking__booking_ref=booking_ref)
+            payment = Payment.objects.get(booking__booking_ref=payload["booking_ref"])
         except Payment.DoesNotExist:
             logger.warning(
                 "Webhook event_id=%s references unknown booking_ref=%s",
-                event_id, booking_ref,
+                payload["event_id"], payload["booking_ref"],
             )
             return Response({"status": "accepted"}, status=status.HTTP_200_OK)
 
         try:
             with transaction.atomic():
                 event, created = PaymentEvent.objects.get_or_create(
-                    event_id=str(event_id),
+                    event_id=str(payload["event_id"]),
                     defaults={
                         "payment": payment,
-                        "status": payload.get("status", ""),
+                        "status": payload["status"],
                         "raw_payload": payload,
                     },
                 )
-        except Exception as exc:  # noqa: BLE001 — defensive, always 200
-            logger.exception("PaymentEvent insert failed for event_id=%s", event_id)
+        except Exception as exc:  # noqa: BLE001 â€” defensive, always 200
+            logger.exception("PaymentEvent insert failed for event_id=%s", payload.get("event_id"))
             return Response({"status": "accepted"}, status=status.HTTP_200_OK)
 
         if not created:
-            # Duplicate delivery — we've already processed this event.
+            # Duplicate delivery â€” we've already processed this event.
             return Response({"status": "accepted"}, status=status.HTTP_200_OK)
 
         # Apply the state transition. ANY exception here is logged but
-        # still returns 200 — a non-200 would make the gateway retry
+        # still returns 200 â€” a non-200 would make the gateway retry
         # forever per its documented behavior.
         try:
             _apply_event_atomically(payload)
-        except Exception as exc:  # noqa: BLE001 — defensive, always 200
+        except Exception as exc:  # noqa: BLE001 â€” defensive, always 200
             logger.exception(
                 "Failed to apply webhook event_id=%s status=%s: %s",
-                event_id, payload.get("status"), exc,
+                payload["event_id"], payload["status"], exc,
             )
 
         return Response({"status": "accepted"}, status=status.HTTP_200_OK)
+

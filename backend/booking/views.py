@@ -61,17 +61,21 @@ def _conflict() -> Response:
     )
 
 
-def _dispatch_otp_send(phone: str, ref: str) -> None:
+def _dispatch_otp_send(phone: str, ref: str, callback_url: str | None = None) -> None:
     """Fire-and-forget gateway call for OTP dispatch.
 
     Lives in a daemon thread so the HTTP latency of the upstream gateway
     can never block the API response. Exceptions are swallowed and logged —
     the OTP ``SENT`` row is our source of truth; whether the SMS actually
     arrived is the gateway's responsibility per its documented behavior.
+
+    ``callback_url``, when provided, is forwarded to the gateway so it can
+    POST a delivery receipt back to ``/api/webhooks/otp/`` (we then stash
+    the delivered code on the matching ``OtpVerification`` row).
     """
     def _worker() -> None:
         try:
-            gateway.send_otp(phone=phone, ref=ref)
+            gateway.send_otp(phone=phone, ref=ref, callback_url=callback_url)
         except gateway.GatewayError as exc:
             logger.warning("OTP send to gateway failed for ref=%s: %s", ref, exc)
         except Exception:  # pragma: no cover - defensive
@@ -81,9 +85,18 @@ def _dispatch_otp_send(phone: str, ref: str) -> None:
     thread.start()
 
 
-def _callback_url_for(request) -> str:
-    """Build the absolute URL the gateway should POST back to."""
-    return request.build_absolute_uri("/api/webhooks/payment/")
+def _callback_url_for(request, path: str = "/api/webhooks/payment/") -> str:
+    """Build the absolute URL the gateway should POST back to.
+
+    Uses ``settings.BACKEND_PUBLIC_URL`` (e.g. ``http://backend:8000``) so the
+    callback resolves correctly inside the docker-compose network. The
+    fallback to ``request.build_absolute_uri`` keeps local non-docker dev
+    working.
+    """
+    base = getattr(settings, "BACKEND_PUBLIC_URL", "").rstrip("/")
+    if not base:
+        base = request.build_absolute_uri("/").rstrip("/")
+    return f"{base}{path}"
 
 
 def _total_amount_for_hold(booking: Booking) -> Decimal:
@@ -99,7 +112,12 @@ def _total_amount_for_hold(booking: Booking) -> Decimal:
     return (base_price * seat_count).quantize(Decimal("0.01"))
 
 
-def _dispatch_charge(booking: Booking, amount: Decimal, callback_url: str) -> threading.Thread:
+def _dispatch_charge(
+    booking: Booking,
+    amount: Decimal,
+    callback_url: str,
+    idempotency_key: str | None = None,
+) -> threading.Thread:
     """Fire-and-forget gateway /charge call.
 
     On a successful /charge (HTTP 2xx) we capture the gateway's
@@ -110,6 +128,11 @@ def _dispatch_charge(booking: Booking, amount: Decimal, callback_url: str) -> th
     the user can be told immediately instead of waiting on a webhook
     that will never come.
 
+    ``idempotency_key`` is forwarded to the gateway as the
+    ``Idempotency-Key`` header so retries of the same logical charge
+    collapse into one gateway-side transaction. The same value is also
+    stored on the local Payment row (by the request handler) for audit.
+
     Returns the spawned thread so tests can ``.join()`` on it.
     """
     def _worker() -> None:
@@ -119,6 +142,7 @@ def _dispatch_charge(booking: Booking, amount: Decimal, callback_url: str) -> th
                 currency="BDT",
                 booking_ref=booking.booking_ref,
                 callback_url=callback_url,
+                idempotency_key=idempotency_key,
             )
         except gateway.GatewayError as exc:
             logger.warning(
@@ -176,7 +200,12 @@ def _dispatch_charge(booking: Booking, amount: Decimal, callback_url: str) -> th
     return thread
 
 
-def _dispatch_charge_safe(booking: Booking, amount: Decimal, callback_url: str) -> None:
+def _dispatch_charge_safe(
+    booking: Booking,
+    amount: Decimal,
+    callback_url: str,
+    idempotency_key: str | None = None,
+) -> None:
     """Top-level entrypoint — swallows every exception the worker could raise.
 
     pytest-django raises ``RuntimeError("Database access not allowed…")``
@@ -188,7 +217,12 @@ def _dispatch_charge_safe(booking: Booking, amount: Decimal, callback_url: str) 
     gateway will reconcile eventually.
     """
     try:
-        _dispatch_charge(booking=booking, amount=amount, callback_url=callback_url)
+        _dispatch_charge(
+            booking=booking,
+            amount=amount,
+            callback_url=callback_url,
+            idempotency_key=idempotency_key,
+        )
     except Exception:  # noqa: BLE001 — defensive; worker is fire-and-forget
         logger.exception("charge worker crashed for booking=%s", booking.booking_ref)
 
@@ -328,7 +362,12 @@ class OtpSendView(APIView):
 
         # Fire the gateway call in a daemon thread. The thread will
         # release immediately even if the gateway is slow or down.
-        _dispatch_otp_send(phone=booking.phone, ref=otp.ref)
+        otp_callback_url = _callback_url_for(self.request, "/api/webhooks/otp/")
+        _dispatch_otp_send(
+            phone=booking.phone,
+            ref=otp.ref,
+            callback_url=otp_callback_url,
+        )
 
         body = build_otp_response(booking, otp)
         return Response(body, status=status.HTTP_202_ACCEPTED)
@@ -418,6 +457,18 @@ class PayView(APIView):
                 defaults={"amount": amount, "status": Payment.Status.PENDING},
             )
 
+            # Mint a per-attempt idempotency key. The booking_ref part is
+            # stable across retries of the same booking; the random suffix
+            # lets a fresh client-side retry (after a network blip) escape
+            # the gateway's dedup window if the operator wants it to.
+            # Storing the key on the Payment row ties it to the local
+            # audit trail.
+            if _created or not payment.idempotency_key:
+                payment.idempotency_key = (
+                    f"charge-{locked.booking_ref}-{secrets.token_hex(6)}"
+                )
+                payment.save(update_fields=["idempotency_key"])
+
             # If a Payment already exists for this booking (the client is
             # retrying /pay/), leave its state alone but still fire a new
             # charge — the webhook dedup on event_id will protect us from
@@ -425,6 +476,7 @@ class PayView(APIView):
             # progress if the gateway is reachable now.
             booking_ref_str = locked.booking_ref
             callback_url = _callback_url_for(request)
+            idempotency_key = payment.idempotency_key
 
         # Fire-and-forget the /charge call. The worker tolerates timeouts
         # and 5xx by leaving the Payment PENDING — the webhook will
@@ -433,6 +485,7 @@ class PayView(APIView):
             booking=Booking.objects.get(pk=booking.pk),
             amount=amount,
             callback_url=callback_url,
+            idempotency_key=idempotency_key,
         )
 
         body = {
