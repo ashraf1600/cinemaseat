@@ -143,43 +143,7 @@ microservices. This keeps the architecture simple enough to build and
 operate during the hackathon while still allowing the core booking,
 payment, and concurrency logic to be isolated into modules.
 
-``` mermaid
----
-config:
-  flowchart:
-    rankSpacing: 90
-    nodeSpacing: 55
----
-flowchart TB
-    Client["Client"]
-
-    subgraph Backend["Booking&nbsp;backend&nbsp;(Django&nbsp;/&nbsp;DRF)"]
-        direction LR
-
-        Catalog["Catalog<br/>Movies, shows, seats"]
-        Booking["Seat hold & booking<br/>Row-locked, zero oversell"]
-        Payment["Payment webhook<br/>Idempotent, always 200"]
-    end
-
-    DB["PostgreSQL"]
-    Gateway["Mock gateway<br/>charge / OTP"]
-
-    Client --> Backend
-    Backend --> DB
-    Payment <--> |"charge / webhook"| Gateway
-
-    style Client fill:#99958D,stroke:#111,stroke-width:2px,color:#fff
-    style DB fill:#99958D,stroke:#111,stroke-width:2px,color:#fff
-
-    style Backend fill:#ffffff,stroke:#008577,stroke-width:2px,color:#003D38
-
-    style Catalog fill:#20A477,stroke:#111,stroke-width:2px,color:#fff
-    style Booking fill:#C47D08,stroke:#111,stroke-width:2px,color:#fff
-    style Payment fill:#E65B38,stroke:#111,stroke-width:2px,color:#fff
-
-    style Gateway fill:#5549B8,stroke:#111,stroke-width:2px,color:#fff
-
-    linkStyle default stroke:#666,stroke-width:2px
+``` ![System Architecture](mermaid-diagram.svg)
 ```
 
 ### High-level request flow
