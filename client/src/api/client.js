@@ -2,7 +2,11 @@
 // confirmed the real endpoints match these shapes.
 const USE_MOCK = false;
 
-const BASE_URL = "http://127.0.0.1:8000/api";
+// Use a relative URL so the Vite dev-server proxy (see vite.config.js)
+// forwards `/api/*` to Django during development. To hit a backend on a
+// different host (e.g. a deployed staging server), set VITE_API_BASE_URL
+// in `client/.env.local` to e.g. "https://staging.example.com/api".
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || "/api";
 
 // ---------- Mock data ----------
 

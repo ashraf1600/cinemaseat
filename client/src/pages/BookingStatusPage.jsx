@@ -21,8 +21,11 @@ export default function BookingStatusPage() {
     try {
       const data = await api.getBooking(bookingId);
       setBooking(data);
-      const paymentStatus = data.payment?.status || data.status;
-      if (paymentStatus === "SUCCEEDED" || paymentStatus === "FAILED") {
+      // The live backend returns the booking's lifecycle directly
+      // (`HELD` / `PAID` / `EXPIRED` / `CANCELLED`); ``payment.status``
+      // exists in the mock but not over the wire. Poll only while the
+      // booking is still HELD (i.e. payment is in flight or pending).
+      if (data.status === "PAID" || data.status === "CANCELLED" || data.status === "EXPIRED") {
         stopPolling();
       }
     } catch (err) {
@@ -102,8 +105,11 @@ export default function BookingStatusPage() {
     );
   }
 
-  const paymentStatus = booking.payment?.status || booking.status;
-  const isConfirmed = paymentStatus === "SUCCEEDED";
+  // The live backend reports booking state in `booking.status`. Map
+  // "PAID" to the confirmed-on-screen equivalent ("SUCCEEDED") so the
+  // existing render tree can stay generic.
+  const isConfirmed = booking.status === "PAID";
+  const paymentStatus = isConfirmed ? "SUCCEEDED" : booking.status;
 
   return (
     <div className="max-w-xl mx-auto px-6 pt-12 pb-24">
@@ -157,8 +163,10 @@ export default function BookingStatusPage() {
         </p>
       )}
 
-      {/* Step: OTP */}
-      {booking.status !== "CONFIRMED" && (
+      {/* Step: OTP — only show while the booking is still HELD. Once
+          the booking is PAID the OTP step has already happened (the
+          webhook flips it). */}
+      {booking.status === "HELD" && (
         <div
           className="rounded-xl p-6 border mb-6"
           style={{ background: "var(--surface)", borderColor: "rgba(242,183,5,0.15)" }}
@@ -211,27 +219,27 @@ export default function BookingStatusPage() {
           Status: <span style={{ color: "var(--ink)" }}>{paymentStatus || "Not started"}</span>
         </p>
 
-        {paymentStatus !== "SUCCEEDED" && (
+        {booking.status === "HELD" && (
           <button
             type="button"
             onClick={handlePay}
-            disabled={busy || paymentStatus === "PROCESSING"}
+            disabled={busy}
             className="w-full rounded-lg py-4 font-display text-2xl tracking-wide transition-transform hover:scale-[1.01] disabled:opacity-50 disabled:hover:scale-100"
             style={{ background: "var(--emerald)", color: "var(--bg)" }}
           >
-            {paymentStatus === "PROCESSING" ? "PROCESSING..." : "PAY NOW"}
+            {busy ? "PROCESSING..." : "PAY NOW"}
           </button>
         )}
 
-        {paymentStatus === "PROCESSING" && (
+        {booking.status === "HELD" && busy && (
           <p className="font-mono text-xs mt-3" style={{ color: "var(--muted)" }}>
             Confirming with the gateway — up to 15 seconds.
           </p>
         )}
 
-        {paymentStatus === "FAILED" && (
+        {booking.status === "EXPIRED" && (
           <p className="font-mono text-sm mt-3" style={{ color: "var(--rose)" }}>
-            Payment failed. Try again.
+            Your hold expired before payment was confirmed. Please try again.
           </p>
         )}
 

@@ -26,6 +26,19 @@ DEBUG = os.environ.get("DJANGO_DEBUG", "False").lower() in {"1", "true", "yes", 
 _raw_hosts = os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
 ALLOWED_HOSTS = [h.strip() for h in _raw_hosts.split(",") if h.strip()]
 
+# CORS — allow the Vite dev server to call the API in development. In
+# production the frontend and backend are typically served from the same
+# origin (or via a reverse proxy) so this list should be tightened.
+CORS_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if o.strip()
+]
+
 # ---------------------------------------------------------------------------
 # Applications
 # ---------------------------------------------------------------------------
@@ -64,6 +77,18 @@ try:
     STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 except ImportError:  # pragma: no cover — dev convenience
     STATICFILES_STORAGE = "django.contrib.staticfiles.storage.StaticFilesStorage"
+
+# django-cors-headers is optional — only needed when the frontend lives
+# on a different origin from the API. Probe once at import time so the
+# dev server still boots when running pure API tests.
+try:
+    import corsheaders  # noqa: F401
+    INSTALLED_APPS += ["corsheaders"]  # type: ignore[arg-type]
+    # CorsMiddleware must run before CommonMiddleware so preflight
+    # responses get the right headers even on OPTIONS requests.
+    MIDDLEWARE.insert(1, "corsheaders.middleware.CorsMiddleware")
+except ImportError:  # pragma: no cover — dev convenience
+    pass
 
 ROOT_URLCONF = "config.urls"
 
