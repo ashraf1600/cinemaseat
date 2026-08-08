@@ -143,8 +143,8 @@ microservices. This keeps the architecture simple enough to build and
 operate during the hackathon while still allowing the core booking,
 payment, and concurrency logic to be isolated into modules.
 
-``` !![CinemaSeat Architecture](mermaid-diagram.svg)
-```
+!![CinemaSeat Architecture](mermaid-diagram.svg)
+
 
 ### High-level request flow
 
