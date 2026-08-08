@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #140b1a;
+  --surface: #1f1329;
+  --surface-raised: #2b1938;
+  --gold: #f2b705;
+  --gold-soft: #f5d061;
+  --rose: #e8455c;
+  --emerald: #34d399;
+  --ink: #f8f4ec;
+  --muted: #b6a6c2;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--ink);
+  font-family: "Work Sans", sans-serif;
+}
+
+.font-display {
+  font-family: "Bebas Neue", sans-serif;
+  letter-spacing: 0.03em;
+}
+
+.font-mono {
+  font-family: "JetBrains Mono", monospace;
+}
+
+/* Marquee glow used behind headline text */
+.marquee-glow {
+  text-shadow: 0 0 24px rgba(242, 183, 5, 0.35);
+}
+
+/* Film-strip perforation strip, used as a decorative divider */
+.film-strip {
+  height: 10px;
+  background-image: radial-gradient(circle, var(--surface-raised) 2.5px, transparent 2.5px);
+  background-size: 16px 10px;
+  background-repeat: repeat-x;
+  opacity: 0.6;
+}
+
+/* Ticket-stub card: perforated tear edge down the right side */
+.ticket-stub {
+  position: relative;
+  background: linear-gradient(135deg, var(--surface-raised), var(--surface));
+  border: 1px solid rgba(242, 183, 5, 0.25);
+}
+
+.ticket-stub::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 92px;
+  width: 0;
+  border-left: 2px dashed rgba(246, 240, 227, 0.2);
+}
+
+.ticket-stub::before {
+  content: "";
+  position: absolute;
+  right: 88px;
+  top: -10px;
+  bottom: -10px;
+  width: 20px;
+  background:
+    radial-gradient(circle at 10px 0, transparent 10px, var(--bg) 10px) top / 20px 20px repeat-x,
+    radial-gradient(circle at 10px 20px, transparent 10px, var(--bg) 10px) bottom / 20px 20px repeat-x;
+}
