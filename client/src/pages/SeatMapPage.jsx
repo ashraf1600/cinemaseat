@@ -77,7 +77,7 @@ export default function SeatMapPage() {
   }
 
   const selectedSeats = seats.filter((s) => selectedSeatIds.includes(s.id));
-  const total = selectedSeats.reduce((sum, s) => sum + s.price, 0);
+ const total = selectedSeats.reduce((sum, s) => sum + Number(s.price), 0);
 
   return (
     <div className="max-w-4xl mx-auto px-6 pt-12 pb-24">
