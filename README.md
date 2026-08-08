@@ -1207,30 +1207,11 @@ Required functionality takes priority over bonus features.
 
 ## Team contributions
 
-  -----------------------------------------------------------------------
-  Member                  Role                    Primary Contribution
-  ----------------------- ----------------------- -----------------------
-  Member 1                Backend / Database      Django REST Framework,
-                                                  PostgreSQL, seat
-                                                  locking, booking,
-                                                  payment integration,
-                                                  callback handling
-
-  Member 2                Frontend                React interface, seat
-                                                  map, booking flow, API
-                                                  integration,
-                                                  payment/confirmation UI
-
-  Member 3                DevOps / QA /           Docker, CI/CD,
-                          Documentation           deployment, concurrency
-                                                  testing, failure
-                                                  testing, README,
-                                                  architecture and
-                                                  documentation
-  -----------------------------------------------------------------------
-
-Replace the member placeholders with the actual names before submission.
-
+| Member | Role | Primary Contribution |
+|---|---|---|
+| **Ashraful Islam** | Backend / Database | Django REST Framework, PostgreSQL, seat locking, booking, payment integration, callback handling, Docker |
+| **Touhidul Islam** | Frontend | React interface, seat map, booking flow, API integration, payment/confirmation UI |
+| **[Third Member]** | DevOps / QA / Documentation | CI/CD, deployment, concurrency testing, failure testing, README, architecture and documentation |
 ------------------------------------------------------------------------
 
 ## Attribution
