@@ -70,4 +70,4 @@ class SeatHoldConcurrencyTest(TransactionTestCase):
 
         self.seat.refresh_from_db()
         assert self.seat.status == "HELD"
-        assert Booking.objects.filter(bookingseat__seat=self.seat).count() == 1
+        assert Booking.objects.filter(booking_seats__seat=self.seat).count() == 1
